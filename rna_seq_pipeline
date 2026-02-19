@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+
+import re
+from collections import defaultdict
+import os
+import subprocess
+import sys
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+
+## ==============================================
+## CONFIGURAÇÕES GLOBAIS E CONSTANTES
+## ==============================================
+
+# Configurações de diretórios
+BASE_DIR = Path("Mapeamento")
+FASTQ_DIR = BASE_DIR / "Dados" / "ArquivosParaAnalise"
+REF_DIR = BASE_DIR / "Dados" / "SequenciadeReferencia"
+STAR_INDEX_DIR = BASE_DIR / "Dados" / "DadosdoStar"
+MAPPING_DIR = BASE_DIR / "MapeamentosFeitos"
+SPLIT_DIR = BASE_DIR / "Dados" / "ArquivosParaAnalise" / "separados"
+
+# Formatos de arquivo suportados
+FASTQ_FORMATS = [".fastq", ".fq", ".fastq.gz", ".fq.gz", ".fastqsanger"]
+REF_FORMATS = [".fa", ".fasta", ".fna"]
+GTF_FORMATS = [".gtf", ".gff"]
+BAM_FORMATS = [".bam"]
+
+# Dicionário para armazenar os caminhos dos softwares
+software_paths = {
+    "conda": None,
+    "fastqc": None,
+    "multiqc": None,
+    "STAR": None,
+    "samtools": None,
+    "seqtk": None,
+}
+
+# Variáveis globais para a interface
+root = None
+log_area = None
+fastq_dir_label = None
+ref_dir_label = None
+output_dir_label = None
+progress_var = None
+progress_bar = None
+
+# Controle de progresso
+current_step = 0
+total_steps = 7  # Total de etapas no pipeline completo (inclui separação)
+
+# Diretórios comuns onde os softwares podem estar instalados
+common_paths = [
+    "/usr/bin",
+    "/usr/local/bin",
+    "/opt",
+    "/opt/bin",
+    str(Path.home() / "miniconda3/bin"),
+    str(Path.home() / "anaconda3/bin"),
+]
+
+## ==============================================
+## FUNÇÕES DE UTILIDADE E GERENCIAMENTO
+## ==============================================
+
+def log(message):
+    """Exibe mensagens na área de log"""
+    if log_area:
+        log_area.insert(tk.END, message + "\n")
+        log_area.see(tk.END)
+        root.update_idletasks()
+
+def update_progress(step_name, current, total):
+    """Atualiza a barra de progresso"""
+    progress = (current / total) * 100
+    if progress_var:
+        progress_var.set(progress)
+    if root:
+        root.title(f"Pipeline de RNA-Seq - {step_name} ({current}/{total})")
+    log_area.see(tk.END)
+    root.update_idletasks()
+
+def run_command(command, shell=False, raise_on_error=False):
+    """
+    Executa um comando no sistema.
+    Se raise_on_error=True, lança exceção em caso de falha.
+    Retorna stdout em caso de sucesso, ou None em caso de erro.
+    """
+    try:
+        log(f"Executando comando: {command}")
+        result = subprocess.run(command, shell=shell, check=True,
+                                capture_output=True, text=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Erro ao executar o comando: {command}\n{e.stderr}"
+        log(error_msg)
+        if raise_on_error:
+            raise RuntimeError(error_msg) from e
+        return None
+
+def prompt_sudo_password():
+    """Solicita a senha sudo através de uma janela gráfica"""
+    return simpledialog.askstring("Senha requerida",
+                                  "Digite sua senha sudo para instalar dependências:",
+                                  show='*')
+
+def run_sudo_command(command, password):
+    """Executa um comando sudo com a senha fornecida"""
+    try:
+        sudo_process = subprocess.Popen(['sudo', '-S'] + command.split(),
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        universal_newlines=True)
+        output, error = sudo_process.communicate(password + '\n')
+
+        if sudo_process.returncode != 0:
+            log(f"Erro ao executar comando sudo: {error}")
+            return False
+        return True
+    except Exception as e:
+        log(f"Erro ao executar comando sudo: {str(e)}")
+        return False
+
+## ==============================================
+## FUNÇÕES DE INSTALAÇÃO E DEPENDÊNCIAS
+## ==============================================
+
+def find_software(software_name):
+    """Procura por um software no sistema"""
+    try:
+        result = subprocess.run(["which", software_name],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return result.stdout.strip()
+
+        for path in common_paths:
+            software_path = Path(path) / software_name
+            if software_path.exists():
+                return str(software_path)
+
+        find_command = f"find / -name {software_name} -type f -executable 2>/dev/null | head -n 1"
+        result = subprocess.run(find_command, shell=True,
+                                capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+
+    except Exception as e:
+        log(f"Erro ao procurar {software_name}: {str(e)}")
+    return None
+
+def find_all_software():
+    """Procura por todos os softwares necessários"""
+    for software in software_paths:
+        path = find_software(software)
+        if path:
+            software_paths[software] = path
+            log(f"{software} encontrado em: {path}")
+        else:
+            log(f"{software} não encontrado no sistema.")
+
+    all_found = all(software_paths.values())
+    if all_found:
+        messagebox.showinfo("Sucesso", "Todos os programas necessários foram encontrados!")
+    else:
+        missing = [k for k, v in software_paths.items() if not v]
+        messagebox.showwarning("Aviso", f"Alguns programas não foram encontrados: {', '.join(missing)}")
+
+def install_dependencies():
+    """Instala todas as dependências necessárias"""
+    try:
+        if not os.path.exists("/etc/debian_version"):
+            log("Sistema não é Debian/Ubuntu. Instalação automática pode não funcionar.")
+            return False
+
+        password = prompt_sudo_password()
+        if not password:
+            log("Instalação cancelada: senha não fornecida")
+            return False
+
+        log("Instalando dependências do sistema...")
+        if not run_sudo_command("apt update", password):
+            return False
+        if not run_sudo_command("apt install -y python3-pip python3-tk openjdk-8-jre zlib1g-dev make gcc", password):
+            return False
+
+        conda_path = find_software("conda")
+        if not conda_path:
+            log("Instalando Miniconda...")
+            run_command("wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh", shell=True)
+            run_command("bash ~/miniconda.sh -b -p ~/miniconda3", shell=True)
+            run_command("~/miniconda3/bin/conda init bash", shell=True)
+            software_paths["conda"] = str(Path.home() / "miniconda3" / "bin" / "conda")
+            conda_path = software_paths["conda"]
+
+        log("Configurando ambiente conda...")
+        run_command(f"{conda_path} create -n rna_seq -y", shell=True)
+        # seqtk incluído junto com os demais
+        run_command(f"{conda_path} install -n rna_seq -y -c bioconda fastqc multiqc star samtools seqtk", shell=True)
+
+        find_all_software()
+
+        if not check_dependencies():
+            log("Algumas dependências não puderam ser instaladas automaticamente")
+            return False
+
+        log("Todas as dependências foram instaladas com sucesso!")
+        return True
+
+    except Exception as e:
+        log(f"Erro durante a instalação de dependências: {str(e)}")
+        return False
+
+def check_dependencies():
+    """Verifica se todas as dependências estão instaladas"""
+    missing_deps = [software for software, path in software_paths.items() if not path]
+    if missing_deps:
+        log(f"Dependências faltando: {', '.join(missing_deps)}")
+
+        if messagebox.askyesno("Dependências faltando",
+                               f"Os seguintes programas não foram encontrados:\n{', '.join(missing_deps)}\n\nDeseja instalar automaticamente?"):
+            if install_dependencies():
+                return True
+            else:
+                return False
+        return False
+    else:
+        log("Todas as dependências estão instaladas.")
+        messagebox.showinfo("Sucesso", "Todas as dependências necessárias estão instaladas!")
+        return True
+
+## ==============================================
+## FUNÇÕES DE SELEÇÃO DE DIRETÓRIOS
+## ==============================================
+
+def select_fastq_dir():
+    """Seleciona o diretório com arquivos FASTQ"""
+    dir_path = filedialog.askdirectory()
+    if dir_path:
+        global FASTQ_DIR, SPLIT_DIR
+        FASTQ_DIR = Path(dir_path)
+        SPLIT_DIR = FASTQ_DIR / "separados"
+        fastq_dir_label.config(text=str(FASTQ_DIR))
+        log(f"Diretório de FASTQ selecionado: {FASTQ_DIR}")
+
+def select_ref_dir():
+    """Seleciona o diretório com arquivos de referência"""
+    dir_path = filedialog.askdirectory()
+    if dir_path:
+        global REF_DIR
+        REF_DIR = Path(dir_path)
+        ref_dir_label.config(text=str(REF_DIR))
+        log(f"Diretório de Referência/FASTA selecionado: {REF_DIR}")
+
+def select_output_dir():
+    """Seleciona o diretório de saída"""
+    dir_path = filedialog.askdirectory()
+    if dir_path:
+        global MAPPING_DIR
+        MAPPING_DIR = Path(dir_path)
+        output_dir_label.config(text=str(MAPPING_DIR))
+        log(f"Diretório de saída selecionado: {MAPPING_DIR}")
+
+## ==============================================
+## FUNÇÕES PRINCIPAIS DO PIPELINE
+## ==============================================
+
+def create_directories():
+    """Cria a estrutura de diretórios necessária"""
+    try:
+        log("Criando diretórios...")
+        for directory in [FASTQ_DIR, REF_DIR, STAR_INDEX_DIR, MAPPING_DIR, SPLIT_DIR]:
+            directory.mkdir(parents=True, exist_ok=True)
+            log(f"Diretório criado: {directory}")
+        log("Diretórios criados com sucesso!")
+    except Exception as e:
+        log(f"Erro ao criar diretórios: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao criar diretórios: {str(e)}")
+
+def find_files(directory, extensions):
+    """Encontra arquivos com as extensões especificadas"""
+    files = []
+    try:
+        for ext in extensions:
+            found_files = list(directory.glob(f"*{ext}"))
+            files.extend(found_files)
+            log(f"Encontrados {len(found_files)} arquivos com extensão {ext}")
+        if not files:
+            log(f"Nenhum arquivo com as extensões {extensions} encontrado em {directory}")
+        return files
+    except Exception as e:
+        log(f"Erro ao procurar arquivos: {str(e)}")
+        return []
+
+def try_split_with_seqtk(fastq_file, output_dir):
+    """
+    Tenta separar um arquivo FASTQ em R1 e R2 usando seqtk.
+    Estratégia universal: tenta separar e verifica se o R2 gerado tem conteúdo.
+    - Se R2 tiver reads  → arquivo era interleaved, separação bem-sucedida.
+    - Se R2 ficar vazio  → arquivo é single-end, remove os arquivos gerados.
+    Retorna (r1_path, r2_path) se interleaved, ou (None, None) se single-end ou erro.
+    """
+    if not software_paths["seqtk"]:
+        log("Erro: seqtk não encontrado.")
+        return None, None
+
+    try:
+        base_name = re.sub(r'(\.fastq|\.fq)(\.gz)?$', '', fastq_file.name)
+        r1_path = output_dir / f"{base_name}_R1.fastq"
+        r2_path = output_dir / f"{base_name}_R2.fastq"
+
+        log(f"  Tentando separar {fastq_file.name} com seqtk...")
+
+        cmd_r1 = f"{software_paths['seqtk']} seq -1 \"{fastq_file}\" > \"{r1_path}\""
+        cmd_r2 = f"{software_paths['seqtk']} seq -2 \"{fastq_file}\" > \"{r2_path}\""
+
+        res1 = subprocess.run(cmd_r1, shell=True, capture_output=True, text=True)
+        if res1.returncode != 0:
+            log(f"  Erro ao rodar seqtk -1: {res1.stderr}")
+            return None, None
+
+        res2 = subprocess.run(cmd_r2, shell=True, capture_output=True, text=True)
+        if res2.returncode != 0:
+            log(f"  Erro ao rodar seqtk -2: {res2.stderr}")
+            return None, None
+
+        # Verifica se o R2 tem conteúdo (tamanho > 0)
+        r2_has_content = r2_path.exists() and r2_path.stat().st_size > 0
+
+        if r2_has_content:
+            log(f"  ✓ Interleaved confirmado e separado: {r1_path.name} | {r2_path.name}")
+            return r1_path, r2_path
+        else:
+            # Single-end: remove os arquivos gerados desnecessariamente
+            log(f"  → Single-end detectado (R2 vazio): {fastq_file.name}")
+            for f in [r1_path, r2_path]:
+                if f.exists():
+                    f.unlink()
+            return None, None
+
+    except Exception as e:
+        log(f"  Erro ao tentar separar {fastq_file.name}: {str(e)}")
+        return None, None
+
+def run_split_interleaved():
+    """
+    Etapa do pipeline: tenta separar todos os arquivos FASTQ do diretório em R1/R2.
+    Usa o seqtk para tentar a separação — se o R2 ficar vazio, o arquivo é single-end
+    e os temporários são removidos. Não depende de análise de headers.
+    Arquivos que já possuem _R1/_R2 no nome são ignorados.
+    """
+    try:
+        update_progress("Separando interleaved: Verificando arquivos", 1, 3)
+        log("=== Etapa: Verificação e separação de arquivos interleaved ===")
+
+        if not software_paths["seqtk"]:
+            log("AVISO: seqtk não encontrado. Pulando etapa de separação.")
+            messagebox.showwarning("seqtk não encontrado",
+                                   "O seqtk não foi encontrado no sistema.\n"
+                                   "Arquivos interleaved não serão separados.\n"
+                                   "Instale via: conda install -c bioconda seqtk")
+            return
+
+        all_files = find_files(FASTQ_DIR, FASTQ_FORMATS)
+        if not all_files:
+            log("Nenhum arquivo FASTQ encontrado para verificar.")
+            return
+
+        # Ignora arquivos já na pasta 'separados' ou que já têm _R1/_R2 no nome
+        candidates = [
+            f for f in all_files
+            if SPLIT_DIR not in f.parents
+            and not re.search(r'(_R1|_R2|_1|_2)(\.fastq|\.fq)', f.name)
+        ]
+
+        if not candidates:
+            log("Nenhum arquivo candidato encontrado. Todos já parecem separados.")
+            update_progress("Separando interleaved: Concluído", 3, 3)
+            return
+
+        log(f"{len(candidates)} arquivo(s) para verificar...")
+        SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+
+        interleaved_found = 0
+        update_progress("Separando interleaved: Processando", 2, 3)
+
+        for fastq_file in candidates:
+            log(f"Verificando {fastq_file.name}...")
+            r1, r2 = try_split_with_seqtk(fastq_file, SPLIT_DIR)
+            if r1 and r2:
+                interleaved_found += 1
+
+        update_progress("Separando interleaved: Concluído", 3, 3)
+
+        if interleaved_found == 0:
+            log("Nenhum arquivo interleaved encontrado. Nenhuma separação necessária.")
+        else:
+            log(f"Separação concluída. {interleaved_found} arquivo(s) processado(s).")
+            log(f"Arquivos separados salvos em: {SPLIT_DIR}")
+            messagebox.showinfo("Separação concluída",
+                                f"{interleaved_found} arquivo(s) interleaved separado(s) em R1/R2.\n"
+                                f"Salvos em: {SPLIT_DIR}\n\n"
+                                "O mapeamento usará automaticamente os arquivos separados.")
+
+    except Exception as e:
+        log(f"Erro na etapa de separação: {str(e)}")
+        messagebox.showerror("Erro", f"Falha na separação de arquivos interleaved: {str(e)}")
+
+def run_fastqc():
+    """Executa análise de qualidade com FastQC"""
+    try:
+        update_progress("FastQC: Preparando", 1, 3)
+        log("Executando FastQC...")
+        fastq_files = find_files(FASTQ_DIR, FASTQ_FORMATS)
+
+        if not fastq_files:
+            log("Nenhum arquivo FASTQ encontrado no diretório.")
+            messagebox.showwarning("Aviso", "Nenhum arquivo FASTQ encontrado.")
+            return
+
+        fastqc_output_dir = FASTQ_DIR / "fastqc_results"
+        fastqc_output_dir.mkdir(exist_ok=True)
+
+        update_progress("FastQC: Processando arquivos", 2, 3)
+        for i, file in enumerate(fastq_files, 1):
+            log(f"Processando {file.name} com FastQC... ({i}/{len(fastq_files)})")
+            output = run_command([software_paths["fastqc"], str(file), "-o", str(fastqc_output_dir)])
+            log(output)
+            update_progress(f"FastQC: Arquivo {i}/{len(fastq_files)}", 2 + (i / len(fastq_files)), 3)
+
+        update_progress("FastQC: Concluído", 3, 3)
+        log("FastQC concluído!")
+    except Exception as e:
+        log(f"Erro ao executar FastQC: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao executar FastQC: {str(e)}")
+
+def run_multiqc():
+    """Executa análise agregada com MultiQC"""
+    try:
+        update_progress("MultiQC: Preparando", 1, 2)
+        log("Executando MultiQC...")
+        multiqc_output_dir = BASE_DIR / "MultiQC_Results"
+        multiqc_output_dir.mkdir(exist_ok=True)
+
+        update_progress("MultiQC: Executando", 2, 2)
+        output = run_command([software_paths["multiqc"], str(FASTQ_DIR), "-o", str(multiqc_output_dir)])
+        log(output)
+        log(f"MultiQC concluído! Resultados em {multiqc_output_dir}")
+    except Exception as e:
+        log(f"Erro ao executar MultiQC: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao executar MultiQC: {str(e)}")
+
+def generate_star_index():
+    """Gera o índice de genoma para o STAR"""
+    try:
+        update_progress("STAR: Preparando índice", 1, 3)
+        log("Gerando índice de genomas com STAR...")
+        fasta_files = find_files(REF_DIR, REF_FORMATS)
+        gtf_files = find_files(REF_DIR, GTF_FORMATS)
+
+        if not fasta_files:
+            log("Arquivos FASTA de referência não encontrados.")
+            messagebox.showwarning("Aviso", "Arquivos FASTA de referência não encontrados.")
+            return
+
+        if not gtf_files:
+            log("Arquivos GTF/GFF de anotação não encontrados.")
+            messagebox.showwarning("Aviso", "Arquivos GTF/GFF de anotação não encontrados.")
+            return
+
+        if any(STAR_INDEX_DIR.iterdir()):
+            log("Limpando diretório de índice existente...")
+            for file in STAR_INDEX_DIR.iterdir():
+                if file.is_file():
+                    file.unlink()
+
+        script_path = STAR_INDEX_DIR / "generate_DadosdoStar.sh"
+        script_content = f"""#!/bin/bash
+{software_paths["STAR"]} --runThreadN 4 \\
+     --limitGenomeGenerateRAM 2000000000 \\
+     --runMode genomeGenerate \\
+     --genomeDir {STAR_INDEX_DIR} \\
+     --genomeFastaFiles {fasta_files[0]} \\
+     --sjdbGTFfeatureExon {gtf_files[0]} \\
+     --genomeSAindexNbases 12
+"""
+        with open(script_path, "w") as f:
+            f.write(script_content)
+
+        # Gera o índice .fai do FASTA de referência se ainda não existir
+        fai_path = Path(str(fasta_files[0]) + ".fai")
+        if fai_path.exists():
+            log(f"Índice FASTA (.fai) já existe: {fai_path.name}")
+        else:
+            log(f"Gerando índice FASTA (.fai) para {fasta_files[0].name}...")
+            output = run_command([software_paths["samtools"], "faidx", str(fasta_files[0])])
+            if fai_path.exists():
+                log(f"  ✓ Índice {fai_path.name} gerado com sucesso.")
+            else:
+                log(f"  ✗ Falha ao gerar índice .fai. Verifique se o FASTA está correto.")
+
+        run_command(["chmod", "+x", str(script_path)])
+        log(f"Script para geração de índice criado: {script_path}")
+
+        update_progress("STAR: Gerando índice", 2, 3)
+        output = run_command(["bash", str(script_path)])
+        log(output)
+
+        update_progress("STAR: Índice concluído", 3, 3)
+        log("Índice de genomas gerado com sucesso!")
+    except Exception as e:
+        log(f"Erro ao gerar índice STAR: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao gerar índice STAR: {str(e)}")
+
+def run_star_mapping():
+    """
+    Identifica amostras por nomes semelhantes e processa todas em loop.
+    Prioriza arquivos da pasta 'separados/' quando disponíveis,
+    garantindo que arquivos gerados pela separação de interleaved sejam reconhecidos.
+    """
+    try:
+        update_progress("STAR: Agrupando amostras", 1, 3)
+        log("Buscando e agrupando arquivos FASTQ por amostra...")
+
+        # Usa arquivos separados se existirem, senão usa o diretório principal
+        source_dir = SPLIT_DIR if (SPLIT_DIR.exists() and any(SPLIT_DIR.iterdir())) else FASTQ_DIR
+        log(f"Usando arquivos de: {source_dir}")
+
+        all_files = find_files(source_dir, FASTQ_FORMATS)
+        if not all_files:
+            log("Nenhum arquivo FASTQ encontrado.")
+            return
+
+        # Agrupa arquivos pelo nome base (ignora _R1, _1, etc.)
+        samples = defaultdict(list)
+        for f in all_files:
+            base_name = re.sub(r'(_R[12]|_[12])?(\.fastq|\.fq).*$', '', f.name)
+            samples[base_name].append(f)
+
+        total_samples = len(samples)
+        log(f"Detectadas {total_samples} amostras para processar.")
+        failed_samples = []
+
+        for i, (sample_name, files) in enumerate(samples.items(), 1):
+            files.sort()  # Garante R1 antes de R2
+
+            f1 = f"\"{files[0]}\""
+            f2 = f"\"{files[1]}\"" if len(files) >= 2 else ""
+            idx_dir = f"\"{STAR_INDEX_DIR}\""
+            output_prefix = f"\"{MAPPING_DIR}/{sample_name}_\""
+
+            read_cmd = "cat" if not str(files[0]).endswith(".gz") else "zcat"
+
+            log(f"Processando ({i}/{total_samples}): {sample_name}")
+            update_progress(f"Mapeando {sample_name}", 2, 3)
+
+            script_path = MAPPING_DIR / f"run_star_{sample_name}.sh"
+            script_content = f"""#!/bin/bash
+{software_paths["STAR"]} --runThreadN 4 \\
+--genomeDir {idx_dir} \\
+--readFilesIn {f1} {f2} \\
+--outSAMtype BAM SortedByCoordinate \\
+--outFileNamePrefix {output_prefix} \\
+--readFilesCommand {read_cmd} \\
+--limitBAMsortRAM 4000000000
+"""
+            with open(script_path, "w") as f_sh:
+                f_sh.write(script_content)
+
+            run_command(["chmod", "+x", str(script_path)])
+            try:
+                output = run_command(["bash", str(script_path)], raise_on_error=True)
+                log(output)
+                log(f"  ✓ Amostra {sample_name} mapeada com sucesso.")
+            except RuntimeError as e:
+                log(f"  ✗ Falha ao mapear amostra {sample_name}. Continuando com as demais...")
+                failed_samples.append(sample_name)
+
+        update_progress("STAR: Mapeamento concluído", 3, 3)
+        if failed_samples:
+            msg = f"Mapeamento concluído com erros.\nAmostras com falha: {', '.join(failed_samples)}"
+            log(msg)
+            messagebox.showwarning("Atenção", msg)
+        else:
+            log("Todas as amostras foram mapeadas com sucesso!")
+
+    except Exception as e:
+        log(f"Erro ao processar mapeamento: {str(e)}")
+        messagebox.showerror("Erro", f"Falha no mapeamento: {str(e)}")
+
+def run_multiqc_star():
+    """Executa MultiQC nos resultados do STAR"""
+    try:
+        update_progress("MultiQC STAR: Preparando", 1, 2)
+        log("Executando MultiQC nos resultados do STAR...")
+        multiqc_star_output_dir = BASE_DIR / "MultiQC_STAR_Results"
+        multiqc_star_output_dir.mkdir(exist_ok=True)
+
+        update_progress("MultiQC STAR: Executando", 2, 2)
+        output = run_command([software_paths["multiqc"], str(MAPPING_DIR), "-o", str(multiqc_star_output_dir)])
+        log(output)
+        log(f"MultiQC nos resultados do STAR concluído! Resultados em {multiqc_star_output_dir}")
+    except Exception as e:
+        log(f"Erro ao executar MultiQC para resultados STAR: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao executar MultiQC para resultados STAR: {str(e)}")
+
+def index_bam():
+    """Indexa arquivos BAM com Samtools"""
+    try:
+        log("Indexando arquivo BAM com Samtools...")
+        bam_files = find_files(MAPPING_DIR, BAM_FORMATS)
+
+        if not bam_files:
+            log("Nenhum arquivo BAM encontrado. Execute o mapeamento STAR primeiro.")
+            messagebox.showwarning("Aviso", "Nenhum arquivo BAM encontrado. Execute o mapeamento STAR primeiro.")
+            return
+
+        total_files = len(bam_files)
+        indexed_ok = 0
+        skipped = []
+        for i, bam_file in enumerate(bam_files, 1):
+            log(f"Indexando {bam_file.name}... ({i}/{total_files})")
+            update_progress(f"Indexando BAM {i}/{total_files}", i, total_files)
+            # Verifica se o BAM tem tamanho mínimo antes de tentar indexar
+            if bam_file.stat().st_size < 1024:
+                log(f"  ✗ Pulando {bam_file.name}: arquivo muito pequeno ou incompleto.")
+                skipped.append(bam_file.name)
+                continue
+            output = run_command([software_paths["samtools"], "index", str(bam_file)])
+            if output is not None:
+                log(f"  ✓ {bam_file.name} indexado.")
+                indexed_ok += 1
+            else:
+                skipped.append(bam_file.name)
+
+        if skipped:
+            log(f"Indexação concluída com avisos. Arquivos ignorados: {', '.join(skipped)}")
+        else:
+            log(f"Todos os {indexed_ok} arquivos BAM indexados com sucesso!")
+        update_progress("Indexação concluída", total_files, total_files)
+    except Exception as e:
+        log(f"Erro ao indexar BAM: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao indexar BAM: {str(e)}")
+
+def run_pipeline():
+    """Executa o pipeline completo"""
+    global current_step
+    try:
+        log("Iniciando pipeline...")
+        current_step = 0
+
+        if not check_dependencies():
+            log("Algumas dependências estão faltando. Verifique os logs.")
+            messagebox.showwarning("Aviso", "Algumas dependências estão faltando. Verifique os logs.")
+            return
+
+        current_step += 1
+        update_progress("Criando diretórios", current_step, total_steps)
+        create_directories()
+
+        current_step += 1
+        update_progress("Separando arquivos interleaved", current_step, total_steps)
+        run_split_interleaved()
+
+        current_step += 1
+        update_progress("Executando FastQC", current_step, total_steps)
+        run_fastqc()
+
+        current_step += 1
+        update_progress("Executando MultiQC", current_step, total_steps)
+        run_multiqc()
+
+        current_step += 1
+        update_progress("Gerando índice STAR", current_step, total_steps)
+        generate_star_index()
+
+        current_step += 1
+        update_progress("Mapeando com STAR", current_step, total_steps)
+        run_star_mapping()
+
+        current_step += 1
+        update_progress("MultiQC (STAR)", current_step, total_steps)
+        run_multiqc_star()
+
+        current_step += 1
+        update_progress("Indexando BAM", current_step, total_steps)
+        index_bam()
+
+        log("Pipeline concluído!")
+        messagebox.showinfo("Sucesso", "Pipeline concluído com sucesso!")
+        progress_var.set(0)
+        root.title("Pipeline de RNA-Seq")
+    except Exception as e:
+        log(f"Erro ao executar pipeline: {str(e)}")
+        messagebox.showerror("Erro", f"Falha ao executar pipeline: {str(e)}")
+        progress_var.set(0)
+        root.title("Pipeline de RNA-Seq")
+
+## ==============================================
+## INTERFACE GRÁFICA
+## ==============================================
+
+def create_gui():
+    """Cria a interface gráfica principal"""
+    global root, log_area, fastq_dir_label, ref_dir_label, output_dir_label, progress_var, progress_bar
+
+    root = tk.Tk()
+    root.title("Pipeline de RNA-Seq")
+    root.geometry("800x650")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    config_frame = ttk.Frame(notebook, padding="10")
+    notebook.add(config_frame, text="Configuração")
+
+    # Frame de instalação de dependências
+    install_frame = ttk.LabelFrame(config_frame, text="Gerenciamento de Dependências", padding="10")
+    install_frame.pack(fill=tk.X, expand=False, pady=5)
+
+    ttk.Button(install_frame, text="Instalar/Verificar Dependências",
+               command=lambda: [find_all_software(), check_dependencies()]).pack(fill=tk.X, pady=5)
+
+    # Frame de seleção de diretórios
+    dir_frame = ttk.LabelFrame(config_frame, text="Diretórios", padding="10")
+    dir_frame.pack(fill=tk.X, expand=False, pady=5)
+
+    ttk.Label(dir_frame, text="Diretório de FASTQ:").grid(row=0, column=0, sticky=tk.W, pady=5)
+    fastq_dir_label = ttk.Label(dir_frame, text=str(FASTQ_DIR))
+    fastq_dir_label.grid(row=0, column=1, sticky=tk.W)
+    ttk.Button(dir_frame, text="Selecionar", command=select_fastq_dir).grid(row=0, column=2, padx=5)
+
+    ttk.Label(dir_frame, text="Diretório de Referência/FASTA:").grid(row=1, column=0, sticky=tk.W, pady=5)
+    ref_dir_label = ttk.Label(dir_frame, text=str(REF_DIR))
+    ref_dir_label.grid(row=1, column=1, sticky=tk.W)
+    ttk.Button(dir_frame, text="Selecionar", command=select_ref_dir).grid(row=1, column=2, padx=5)
+
+    ttk.Label(dir_frame, text="Diretório de Saída:").grid(row=2, column=0, sticky=tk.W, pady=5)
+    output_dir_label = ttk.Label(dir_frame, text=str(MAPPING_DIR))
+    output_dir_label.grid(row=2, column=1, sticky=tk.W)
+    ttk.Button(dir_frame, text="Selecionar", command=select_output_dir).grid(row=2, column=2, padx=5)
+
+    # Frame de etapas individuais
+    steps_frame = ttk.LabelFrame(config_frame, text="Etapas Individuais", padding="10")
+    steps_frame.pack(fill=tk.X, expand=False, pady=5)
+
+    ttk.Button(steps_frame, text="Criar Diretórios",
+               command=create_directories).grid(row=0, column=0, padx=5, pady=5)
+    ttk.Button(steps_frame, text="Separar Interleaved",
+               command=run_split_interleaved).grid(row=0, column=1, padx=5, pady=5)
+    ttk.Button(steps_frame, text="FastQC",
+               command=run_fastqc).grid(row=0, column=2, padx=5, pady=5)
+    ttk.Button(steps_frame, text="MultiQC",
+               command=run_multiqc).grid(row=0, column=3, padx=5, pady=5)
+
+    ttk.Button(steps_frame, text="Gerar Índice STAR",
+               command=generate_star_index).grid(row=1, column=0, padx=5, pady=5)
+    ttk.Button(steps_frame, text="Mapear com STAR",
+               command=run_star_mapping).grid(row=1, column=1, padx=5, pady=5)
+    ttk.Button(steps_frame, text="MultiQC (STAR)",
+               command=run_multiqc_star).grid(row=1, column=2, padx=5, pady=5)
+    ttk.Button(steps_frame, text="Samtools",
+               command=index_bam).grid(row=1, column=3, padx=5, pady=5)
+
+    # Frame do pipeline completo
+    pipeline_frame = ttk.LabelFrame(config_frame, text="Pipeline Completo", padding="10")
+    pipeline_frame.pack(fill=tk.X, expand=False, pady=5)
+
+    ttk.Button(pipeline_frame, text="Executar Pipeline Completo",
+               command=run_pipeline).pack(fill=tk.X, pady=5)
+
+    # Frame de logs
+    log_frame = ttk.Frame(notebook, padding="10")
+    notebook.add(log_frame, text="Logs")
+
+    log_area = scrolledtext.ScrolledText(log_frame, width=90, height=30, wrap=tk.WORD)
+    log_area.pack(fill=tk.BOTH, expand=True)
+
+    ttk.Button(log_frame, text="Limpar Logs",
+               command=lambda: log_area.delete(1.0, tk.END)).pack(pady=5)
+
+    # Barra de progresso
+    progress_frame = ttk.Frame(root)
+    progress_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100, mode='determinate')
+    progress_bar.pack(fill=tk.X, expand=True)
+
+    # Barra de status
+    status_frame = ttk.Frame(root)
+    status_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+    status_label = ttk.Label(status_frame, text="Pronto")
+    status_label.pack(side=tk.LEFT, padx=10)
+
+    ttk.Button(status_frame, text="Sair", command=root.quit).pack(side=tk.RIGHT, padx=10, pady=5)
+
+    log("Bem-vindo ao Pipeline de RNA-Seq!")
+    log("Selecione os diretórios e execute as etapas do pipeline.")
+
+    # Verifica automaticamente as dependências ao iniciar
+    find_all_software()
+    check_dependencies()
+
+    return root
+
+## ==============================================
+## PONTO DE ENTRADA DO PROGRAMA
+## ==============================================
+
+if __name__ == "__main__":
+    try:
+        app = create_gui()
+        app.mainloop()
+    except Exception as e:
+        print(f"Erro fatal ao iniciar a aplicação: {str(e)}")
+        tk.messagebox.showerror("Erro Fatal", f"Não foi possível iniciar a aplicação:\n{str(e)}")
